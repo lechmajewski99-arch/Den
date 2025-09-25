@@ -1,22 +1,15 @@
 # marta_agent.py
-# -------------------------------------------------------------
-# Marta w osobnym module.
-# - train_marta_to_file(...) — uczy Martę offline i zapisuje wagi do JSON.
-# - make_marta_strategy(...) — ładuje wagi i ZWRACA zero-argumentową funkcję
-#   do wstawienia w players["Marta"]["strategy"], BEZ zmiany kodu gry.
-#   W środku: perceptron + "systemy z dupy" + ryzyko.
-# -------------------------------------------------------------
+# Marta jako zewnętrzna strategia do Twojej gry (gra zostaje nietknięta).
+# - train_marta_to_file(...)  [opcjonalne] – offline "charakteryzuje" wagi i zapisuje do JSON
+# - make_marta_strategy(..., mode="capped"| "unbounded", cap=..., k_unbound=...) -> funkcja bez argumentów
 
 import json
 import math
 import random
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Callable
 
-# Zakres rozsądnych cashoutów dla gracza (gra nadal ma crash w [1, ∞))
-MIN_CASHOUT = 1.10
-MAX_CASHOUT = 10.0
+MIN_CASHOUT = 1.10   # zawsze >1, żeby był zysk
 
-# --- proste funkcje pomocnicze ---
 def _sigmoid(z: float) -> float:
     if z >= 0:
         ez = math.exp(-z)
@@ -27,92 +20,114 @@ def _sigmoid(z: float) -> float:
 def _clip(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
-# --- generator crasha do self-play (offline training) ---
-# Eksponencjalny ogon: crash w [1, ∞). To NIE jest używane przez grę,
-# tylko przez trening offline.
-def _sample_crash(lam: float = 1.2) -> float:
-    return 1.0 + random.expovariate(lam)
+# --- generator z ciężkim ogonem (do "systemów z dupy") ---
+def _pareto(xm: float = 2.0, alpha: float = 1.3) -> float:
+    # losuje z Pareto(xm, alpha); rośnie do ∞
+    u = 1.0 - random.random()
+    return xm / (u ** (1.0 / alpha))
 
-# ============================================================
-#                 WEWNĘTRZNY MODEL MARTY
-# ============================================================
 class _MartaPerceptron:
-    """
-    Lekki perceptron Marty używany TYLKO offline (trening) i online (predykcja).
-    W grze nie ma uczenia online, bo strategia ma zero argumentów.
-    """
-    def __init__(self, init_balance: float = 100.0):
-        # Wagi dla cech: [bias, mood, superstition, drift]
-        # (używamy TYLKO cech, które nie wymagają danych z gry)
-        # Dlaczego tak? Bo w grze strategia nic nie dostaje (brak crash/balance).
+    """Wewnętrzny, lekki model Marty. Działa bez danych z gry (funkcja bez argumentów)."""
+    def __init__(self):
+        # minimalny zestaw cech nieuwarunkowanych na stanie gry
+        # [bias, mood, superstition, drift]
         self.w: List[float] = [0.0, 0.3, 0.3, 0.2]
-
-        # Stan pseudo-wewnętrzny (niezależny od gry)
-        self._mood = 0.0           # [-1, 1]
-        self._drift = 0.0          # powolny dryf decyzyjny
-        self.risk_bias = 0.25      # skłonność w górę
-        self.noise_decision = 0.10 # losowość w decyzji
+        self._mood = 0.0              # [-1, 1]
+        self._drift = 0.0
+        self.risk_bias = 0.25         # pcha w górę
+        self.noise_decision = 0.10    # losowość decyzji
 
     def _features(self) -> List[float]:
         superstition = 2.0 * (random.random() - 0.5)  # [-1, 1]
         return [1.0, self._mood, superstition, self._drift]
 
-    def decide_cashout(self) -> float:
+    def _base_score(self) -> float:
         x = self._features()
         z = sum(wi * xi for wi, xi in zip(self.w, x))
-        p = _sigmoid(z)
-        m = MIN_CASHOUT + p * (MAX_CASHOUT - MIN_CASHOUT)
+        p = _sigmoid(z)  # 0..1
+        return p
 
-        # ryzykanctwo
-        m = m * (1 - self.risk_bias) + (MIN_CASHOUT + 0.85 * (MAX_CASHOUT - MIN_CASHOUT)) * self.risk_bias
+    def decide_cashout(
+        self,
+        *,
+        mode: str = "capped",
+        cap: Optional[float] = 10.0,
+        k_unbound: float = 5.0,
+        pareto_prob: float = 0.12,
+        override_prob: float = 0.35
+    ) -> float:
+        """
+        mode="capped": cashout w [MIN_CASHOUT, cap]
+        mode="unbounded": cashout w [MIN_CASHOUT, ∞) poprzez transformację p/(1-p)
+        - k_unbound: skala agresji dla trybu unbounded (większe => częściej bardzo wysokie)
+        - pareto_prob: szansa na "dziki" strzał z ogona Pareto (10+)
+        - override_prob: szansa na nadpisanie "systemem z dupy"
+        """
+        p = self._base_score()
 
-        # systemy z dupy (nadpisanie ~35%)
-        if random.random() < 0.35:
-            systems = [
-                ("hot_hand", random.uniform(2.5, MAX_CASHOUT)),
-                ("odkuwka",  random.uniform(3.0, MAX_CASHOUT)),
-                ("lucky",    random.uniform(2.0, MAX_CASHOUT)),
-                ("szosty",   random.uniform(2.0, MAX_CASHOUT)),
-            ]
-            m = random.choice(systems)[1]
+        if mode == "unbounded":
+            # transformacja rosnąca do ∞ wraz z p→1
+            # m = MIN + k * p/(1-p)
+            denom = max(1e-6, 1.0 - p)
+            m = MIN_CASHOUT + k_unbound * (p / denom)
+        else:
+            # ograniczony zakres [MIN, cap]
+            _cap = cap if (cap is not None and cap > MIN_CASHOUT) else 10.0
+            m = MIN_CASHOUT + p * (_cap - MIN_CASHOUT)
 
-        # chaos
+        # ryzykowny bias – podciąga ku wysokim wartościom
+        if mode == "capped":
+            _cap = cap if (cap is not None and cap > MIN_CASHOUT) else 10.0
+            target_high = MIN_CASHOUT + 0.85 * (_cap - MIN_CASHOUT)
+            m = m * (1 - self.risk_bias) + target_high * self.risk_bias
+        else:
+            # w unbounded po prostu dodajemy odchył w górę zależny od p
+            m += self.risk_bias * (1.0 + 4.0 * p)
+
+        # "systemy z dupy" – nadpisania
+        if random.random() < override_prob:
+            picks = []
+            # "hot hand"
+            picks.append(random.uniform(2.5, cap if (mode == "capped" and cap) else 6.0))
+            # "odkuwka"
+            picks.append(random.uniform(3.0, cap if (mode == "capped" and cap) else 12.0))
+            # "szósty zmysł"
+            picks.append(random.uniform(2.0, cap if (mode == "capped" and cap) else 8.0))
+            m = random.choice(picks)
+
+        # ciężki ogon (rzadko bardzo duże wartości)
+        if mode == "unbounded" and random.random() < pareto_prob:
+            m = max(m, _pareto(xm=2.0, alpha=random.uniform(1.2, 1.8)))
+
+        # chaos decyzyjny
         m += random.gauss(0.0, self.noise_decision)
 
-        # dryfy stanów (lekko)
+        # dryfy stanów
         self._mood  = _clip(0.9 * self._mood  + random.uniform(-0.12, 0.12), -1.0, 1.0)
         self._drift = _clip(0.98 * self._drift + random.uniform(-0.02, 0.02), -1.0, 1.0)
 
-        return _clip(m, MIN_CASHOUT, MAX_CASHOUT)
+        # zabezpieczenie numeryczne
+        m = max(MIN_CASHOUT, m)
+        if not math.isfinite(m):
+            m = 2.0
+        # miękki limit bezpieczeństwa (ogranicza tylko absurdalne overflowy)
+        return min(m, 1e9)
 
-    # --------- OFFLINE TRAINING (self-play) ----------
+    # ===== prościutki trening offline (charakteryzowanie) =====
     def train_offline(self, episodes: int = 3000, seed: int = 123) -> None:
-        """
-        Uczy wagi na sztucznych danych (bez balansu/crasha z gry).
-        Cel: „wzmocnić” skłonność do ryzyka i rozrzut decyzji.
-        Tu nie naśladujemy dokładnego optymalizatora — trening jest
-        po to, by wagi dawały „charakter Marty”.
-        """
         random.seed(seed)
         lr = 0.03
         for _ in range(episodes):
-            # syntetyczne "docelowe" wyjście m_target: preferuj wysoko
-            # (tu uczymy tylko 'styl' ryzykowny, nie precyzję względem crasha)
-            desired = random.uniform(2.2, MAX_CASHOUT)
-
-            # forward
-            x = self._features()
-            z = sum(wi * xi for wi, xi in zip(self.w, x))
-            p = _sigmoid(z)
-            y_hat = MIN_CASHOUT + p * (MAX_CASHOUT - MIN_CASHOUT)
-
-            # prosta aktualizacja w stronę desired (MSE)
-            dy_dz = (MAX_CASHOUT - MIN_CASHOUT) * p * (1 - p)
+            desired = random.uniform(2.2, 8.0)  # uczymy "ryzykowny styl", nie precyzję względem crasha
+            p = self._base_score()
+            # y_hat w "capped" z cap=10
+            y_hat = MIN_CASHOUT + p * (10.0 - MIN_CASHOUT)
+            dy_dz = (10.0 - MIN_CASHOUT) * p * (1 - p)
             grad = (y_hat - desired) * dy_dz
+            x = self._features()
             for i in range(len(self.w)):
                 self.w[i] -= lr * grad * x[i]
 
-    # --------- SERIALIZACJA ---------
     def to_dict(self) -> Dict[str, Any]:
         return {
             "w": self.w,
@@ -122,47 +137,39 @@ class _MartaPerceptron:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "_MartaPerceptron":
-        obj = cls()
-        obj.w = list(d.get("w", [0.0, 0.3, 0.3, 0.2]))
-        obj.risk_bias = float(d.get("risk_bias", 0.25))
-        obj.noise_decision = float(d.get("noise_decision", 0.10))
-        return obj
+        o = cls()
+        o.w = list(d.get("w", o.w))
+        o.risk_bias = float(d.get("risk_bias", o.risk_bias))
+        o.noise_decision = float(d.get("noise_decision", o.noise_decision))
+        return o
 
-# ============================================================
-#                  API DLA TWOJEJ GRY
-# ============================================================
+# =================== API DLA TWOJEJ GRY ===================
 
 def train_marta_to_file(path: str = "marta_weights.json", episodes: int = 3000, seed: int = 123) -> None:
-    """
-    Uczy Martę OFFLINE i zapisuje wagi do JSON.
-    Uruchamiasz to JEDEN raz przed grą (np. z konsoli/REPL).
-    """
     m = _MartaPerceptron()
     m.train_offline(episodes=episodes, seed=seed)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(m.to_dict(), f)
     print(f"[marta_agent] Zapisano wagi do: {path}")
 
-def make_marta_strategy(path: str = "marta_weights.json"):
-    """
-    Ładuje zapisane wagi i ZWRACA ZERO-ARGUMENTOWĄ FUNKCJĘ
-    do wstawienia w players['Marta']['strategy'].
-    Gra NIE musi nic wiedzieć o Marcie.
-    """
+def make_marta_strategy(
+    path: str = "marta_weights.json",
+    *,
+    mode: str = "capped",          # "capped" albo "unbounded"
+    cap: Optional[float] = 10.0,   # używane tylko w mode="capped"
+    k_unbound: float = 5.0         # skala agresji w mode="unbounded"
+) -> Callable[[], float]:
+    """Zwraca ZERO-ARGUMENTOWĄ funkcję do wstawienia jako strategy w grze."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         model = _MartaPerceptron.from_dict(data)
     except FileNotFoundError:
-        # fallback: jeśli ktoś zapomniał trenować, bierzemy „fabryczne” wagi
         model = _MartaPerceptron()
-        print("[marta_agent] Uwaga: nie znaleziono wag, używam domyślnych.")
+        print("[marta_agent] Uwaga: brak wag – używam domyślnych.")
 
-    # ZWRACAMY FUNKCJĘ BEZ ARGUMENTÓW (jak Twoje lambda: ...)
+    # funkcja bez argumentów — zgodna z Twoją grą
     def _strategy() -> float:
-        return model.decide_cashout()
+        return model.decide_cashout(mode=mode, cap=cap, k_unbound=k_unbound)
 
     return _strategy
-
-
-train_marta_to_file(path="marta_weights.json", episodes=40000, seed=123)
