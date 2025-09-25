@@ -1,5 +1,6 @@
 import random
 import matplotlib.pyplot as plt
+from marta_strategy import make_marta_strategy
 
 # Ustawienia gry
 num_rounds = 20
@@ -8,7 +9,7 @@ bet_amount = 10
 
 # Gracze i ich strategie
 players = {
-    "Marta": {"balance": initial_balance, "strategy": lambda: random.uniform(1.5, 2.5)},
+    "Marta": {"balance": initial_balance, "strategy": make_marta_strategy("marta_weights.json")},
     "Tom": {"balance": initial_balance, "strategy": lambda: 2.0},
     "Alex": {"balance": initial_balance, "strategy": lambda: random.uniform(1.1, 1.8)}
 }
