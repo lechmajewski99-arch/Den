@@ -1,0 +1,25 @@
+{
+  // Re-enable small/inline autocomplete while keeping AI inline suggestions off
+  "editor.quickSuggestions": {
+    "other": true,
+    "comments": false,
+    "strings": false
+  },
+
+  // Allow suggestions to trigger on characters (keeps small suggestions responsive)
+  "editor.suggestOnTriggerCharacters": true,
+
+  // Disable large AI-style inline suggestions
+  "editor.inlineSuggest.enabled": false,
+
+  // Accept suggestions with Enter (standard behavior for small completions)
+  "editor.acceptSuggestionOnEnter": "on",
+
+  // If GitHub Copilot is installed, prefer workspace-level disable flags
+  "github.copilot": {
+    "enable": false,
+    "inlineSuggest": {
+      "enable": false
+    }
+  }
+}
